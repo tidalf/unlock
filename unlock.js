@@ -48,6 +48,9 @@ async function doEnroll(ikmB64u) {
   const ikm = b64urlDecode(ikmB64u);
   const challenge = crypto.getRandomValues(new Uint8Array(32));
   const userId = crypto.getRandomValues(new Uint8Array(16));
+  // Salt the PRF on enroll so we evaluate in a single ceremony when the
+  // authenticator supports prf-on-create (Chrome 116+ + YubiKey 5.4+).
+  const prfSalt = crypto.getRandomValues(new Uint8Array(32));
 
   const cred = await navigator.credentials.create({
     publicKey: {
@@ -56,35 +59,44 @@ async function doEnroll(ikmB64u) {
       challenge,
       pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
       authenticatorSelection: {
-        // No authenticatorAttachment — let the browser surface both platform
-        // (Touch ID, Hello) and roaming (YubiKey 5.4+, other PRF-capable
-        // security keys) options. The browser's account chooser lets the
-        // user pick.
+        // No authenticatorAttachment — browser shows the chooser with both
+        // platform (Touch ID, Hello) and roaming (YubiKey 5.4+, etc.)
+        // options.
         residentKey: "discouraged", // we always know the credentialId at unlock
-        userVerification: "required",
+        // "discouraged" → YubiKey skips the PIN (touch-only). Touch ID /
+        // Hello still do biometric because that's the only UV the platform
+        // authenticator knows. Trade-off: a stolen + unattended YubiKey
+        // could unlock the vault without the PIN. User-acknowledged choice.
+        userVerification: "discouraged",
       },
-      extensions: { prf: {} },
+      // Eval PRF on create — modern stacks return the result in
+      // getClientExtensionResults() so we don't need a follow-up get().
+      extensions: { prf: { eval: { first: prfSalt } } },
       timeout: 60000,
     },
   });
   if (!cred) throw new Error("credential creation cancelled");
 
-  // The PRF extension is only evaluated reliably on the GET ceremony (some
-  // platforms don't return prf results from create()). Generate a fresh salt
-  // and ask the authenticator for prf evaluation in a follow-up assertion.
-  setStatus("deriving wrapping key — confirm again if asked…");
-  const prfSalt = crypto.getRandomValues(new Uint8Array(32));
-  const assertion = await navigator.credentials.get({
-    publicKey: {
-      challenge: crypto.getRandomValues(new Uint8Array(32)),
-      allowCredentials: [{ type: "public-key", id: cred.rawId }],
-      userVerification: "required",
-      extensions: { prf: { eval: { first: prfSalt } } },
-      timeout: 60000,
-    },
-  });
-  const prfResults = assertion.getClientExtensionResults().prf;
-  const prfFirst = prfResults && prfResults.results && prfResults.results.first;
+  // Try prf-on-create first. If the authenticator/browser didn't return a
+  // PRF result there, fall back to a follow-up get() (older stacks).
+  let prfFirst;
+  const createPrf = cred.getClientExtensionResults().prf;
+  if (createPrf && createPrf.results && createPrf.results.first) {
+    prfFirst = createPrf.results.first;
+  } else {
+    setStatus("deriving wrapping key — confirm again…");
+    const assertion = await navigator.credentials.get({
+      publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        allowCredentials: [{ type: "public-key", id: cred.rawId }],
+        userVerification: "discouraged",
+        extensions: { prf: { eval: { first: prfSalt } } },
+        timeout: 60000,
+      },
+    });
+    const r = assertion.getClientExtensionResults().prf;
+    prfFirst = r && r.results && r.results.first;
+  }
   if (!prfFirst) {
     throw new Error(
       "this device or browser doesn't support the WebAuthn PRF extension",
@@ -128,7 +140,10 @@ async function doUnlock(envelope) {
     publicKey: {
       challenge: crypto.getRandomValues(new Uint8Array(32)),
       allowCredentials: [{ type: "public-key", id: credentialId }],
-      userVerification: "required",
+      // Must match the UV setting used at enroll — Yubico's PRF derivation
+      // mixes in PIN-derived material when UV is on, so changing this
+      // produces a different PRF output and the wrap won't decrypt.
+      userVerification: "discouraged",
       extensions: { prf: { eval: { first: prfSalt } } },
       timeout: 60000,
     },
