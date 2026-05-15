@@ -63,10 +63,21 @@ async function doEnroll(ikmB64u) {
         // platform (Touch ID, Hello) and roaming (YubiKey 5.4+, etc.)
         // options.
         residentKey: "discouraged", // we always know the credentialId at unlock
-        // "discouraged" → YubiKey skips the PIN (touch-only). Touch ID /
-        // Hello still do biometric because that's the only UV the platform
-        // authenticator knows. Trade-off: a stolen + unattended YubiKey
-        // could unlock the vault without the PIN. User-acknowledged choice.
+        // CTAP 2.1 split hmac-secret into CredRandomWithUV (used when UV is
+        // performed — PIN-derived) and CredRandomWithoutUV (used without
+        // UV — touch-only). "discouraged" requests the no-UV path so
+        // YubiKey 5.4+ produces a touch-only PRF and skips the PIN.
+        //
+        // Important catch: pre-CTAP-2.1 YubiKeys (firmware < 5.4) ONLY
+        // have CredRandomWithUV — they don't support a no-UV hmac-secret
+        // path at all, so the authenticator will require PIN regardless
+        // of what we ask. You can detect this hardware: `ykman fido
+        // config toggle-always-uv` returns "Always Require UV is not
+        // supported on this YubiKey." on pre-5.4 firmware.
+        //
+        // On platform authenticators, "discouraged" is a near no-op: UV
+        // and user presence coincide (biometric), so the user still sees
+        // the Touch ID prompt either way.
         userVerification: "discouraged",
       },
       // Eval PRF on create — modern stacks return the result in
