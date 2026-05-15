@@ -44,7 +44,7 @@ function post(payload) {
 }
 
 async function doEnroll(ikmB64u) {
-  setStatus("creating a platform credential — confirm with biometric…");
+  setStatus("creating a credential — confirm with biometric or insert + tap your security key…");
   const ikm = b64urlDecode(ikmB64u);
   const challenge = crypto.getRandomValues(new Uint8Array(32));
   const userId = crypto.getRandomValues(new Uint8Array(16));
@@ -52,12 +52,15 @@ async function doEnroll(ikmB64u) {
   const cred = await navigator.credentials.create({
     publicKey: {
       rp: { name: "rustofill", id: location.hostname },
-      user: { id: userId, name: "rustofill", displayName: "rustofill biometric" },
+      user: { id: userId, name: "rustofill", displayName: "rustofill vault" },
       challenge,
       pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
       authenticatorSelection: {
-        authenticatorAttachment: "platform",
-        residentKey: "preferred",
+        // No authenticatorAttachment — let the browser surface both platform
+        // (Touch ID, Hello) and roaming (YubiKey 5.4+, other PRF-capable
+        // security keys) options. The browser's account chooser lets the
+        // user pick.
+        residentKey: "discouraged", // we always know the credentialId at unlock
         userVerification: "required",
       },
       extensions: { prf: {} },
@@ -69,7 +72,7 @@ async function doEnroll(ikmB64u) {
   // The PRF extension is only evaluated reliably on the GET ceremony (some
   // platforms don't return prf results from create()). Generate a fresh salt
   // and ask the authenticator for prf evaluation in a follow-up assertion.
-  setStatus("deriving wrapping key from biometric — confirm again if asked…");
+  setStatus("deriving wrapping key — confirm again if asked…");
   const prfSalt = crypto.getRandomValues(new Uint8Array(32));
   const assertion = await navigator.credentials.get({
     publicKey: {
@@ -100,7 +103,7 @@ async function doEnroll(ikmB64u) {
     await crypto.subtle.encrypt({ name: "AES-GCM", iv: wrapIv }, aesKey, ikm),
   );
 
-  setStatus("biometric enrolled — sending wrapped key to extension…", "ok");
+  setStatus("authenticator enrolled — sending wrapped key to extension…", "ok");
   post({
     kind: "enrolled",
     credentialId: b64urlEncode(cred.rawId),
@@ -115,7 +118,7 @@ async function doEnroll(ikmB64u) {
 }
 
 async function doUnlock(envelope) {
-  setStatus("asserting platform credential — confirm with biometric…");
+  setStatus("asserting credential — confirm with biometric or tap your security key…");
   const credentialId = b64urlDecode(envelope.credentialId);
   const prfSalt = b64urlDecode(envelope.prfSalt);
   const wrappedIkm = b64urlDecode(envelope.wrappedIkm);
