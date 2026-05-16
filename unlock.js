@@ -43,13 +43,25 @@ function post(payload) {
   window.postMessage({ source: "rustofill-bio", ...payload }, location.origin);
 }
 
-async function doEnroll(ikmB64u) {
-  setStatus("creating a credential — confirm with biometric or insert + tap your security key…");
+async function doEnroll(ikmB64u, _mode) {
+  // One enroll ceremony for everything — Touch ID, Hello, YubiKey, phone.
+  //
+  // userVerification: "preferred" surfaces Touch ID (which UV=discouraged
+  // would have filtered out on macOS Chrome) while still letting a
+  // YubiKey 5.4+ without PIN stay single-tap — the authenticator can't
+  // do UV without PIN so it falls back to UP-only and CTAP 2.1 uses
+  // CredRandomWithoutUV. PRF derivation stays consistent across enroll
+  // and unlock.
+  //
+  // No authenticatorAttachment hint: lets the user pick any device the
+  // browser offers (platform or roaming or hybrid-via-QR). The earlier
+  // split between "security-key" and "platform" was misleading because
+  // "cross-platform" in WebAuthn still includes hybrid/phone — so the
+  // chooser looked identical in both branches anyway.
+  setStatus("creating a credential — confirm with biometric, Touch ID, or tap your security key…");
   const ikm = b64urlDecode(ikmB64u);
   const challenge = crypto.getRandomValues(new Uint8Array(32));
   const userId = crypto.getRandomValues(new Uint8Array(16));
-  // Salt the PRF on enroll so we evaluate in a single ceremony when the
-  // authenticator supports prf-on-create (Chrome 116+ + YubiKey 5.4+).
   const prfSalt = crypto.getRandomValues(new Uint8Array(32));
 
   const cred = await navigator.credentials.create({
@@ -59,26 +71,8 @@ async function doEnroll(ikmB64u) {
       challenge,
       pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
       authenticatorSelection: {
-        // No authenticatorAttachment — browser shows the chooser with both
-        // platform (Touch ID, Hello) and roaming (YubiKey 5.4+, etc.)
-        // options.
-        residentKey: "discouraged", // we always know the credentialId at unlock
-        // CTAP 2.1 split hmac-secret into CredRandomWithUV (used when UV is
-        // performed — PIN-derived) and CredRandomWithoutUV (used without
-        // UV — touch-only). "discouraged" requests the no-UV path so
-        // YubiKey 5.4+ produces a touch-only PRF and skips the PIN.
-        //
-        // Important catch: pre-CTAP-2.1 YubiKeys (firmware < 5.4) ONLY
-        // have CredRandomWithUV — they don't support a no-UV hmac-secret
-        // path at all, so the authenticator will require PIN regardless
-        // of what we ask. You can detect this hardware: `ykman fido
-        // config toggle-always-uv` returns "Always Require UV is not
-        // supported on this YubiKey." on pre-5.4 firmware.
-        //
-        // On platform authenticators, "discouraged" is a near no-op: UV
-        // and user presence coincide (biometric), so the user still sees
-        // the Touch ID prompt either way.
-        userVerification: "discouraged",
+        residentKey: "discouraged",
+        userVerification: "preferred",
       },
       // Eval PRF on create — modern stacks return the result in
       // getClientExtensionResults() so we don't need a follow-up get().
@@ -100,7 +94,7 @@ async function doEnroll(ikmB64u) {
       publicKey: {
         challenge: crypto.getRandomValues(new Uint8Array(32)),
         allowCredentials: [{ type: "public-key", id: cred.rawId }],
-        userVerification: "discouraged",
+        userVerification: "preferred",
         extensions: { prf: { eval: { first: prfSalt } } },
         timeout: 60000,
       },
@@ -150,6 +144,10 @@ async function doUnlock(payload) {
   if (envelopes.length === 0) {
     throw new Error("no envelopes provided");
   }
+  // Always "preferred" — matches enroll. Touch ID always does UV
+  // anyway (PRF stable); YubiKey 5.4+ without PIN falls through to UP
+  // and stays on CredRandomWithoutUV (also stable).
+  const uvMode = "preferred";
 
   setStatus(
     envelopes.length === 1
@@ -180,7 +178,7 @@ async function doUnlock(payload) {
     publicKey: {
       challenge: crypto.getRandomValues(new Uint8Array(32)),
       allowCredentials,
-      userVerification: "discouraged",
+      userVerification: uvMode,
       extensions: { prf: prfExt },
       timeout: 60000,
     },
@@ -227,7 +225,8 @@ window.addEventListener("message", async (event) => {
   try {
     if (action === "enroll") {
       msgEl.textContent = "Enabling biometric unlock…";
-      await doEnroll(event.data.ikm);
+      // mode: "key" | "platform" — default to legacy "key" for back-compat
+      await doEnroll(event.data.ikm, event.data.mode);
     } else if (action === "unlock") {
       msgEl.textContent = "Unlocking your vault…";
       // Pass the whole event.data so doUnlock can pick envelope (legacy)
