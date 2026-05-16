@@ -140,22 +140,48 @@ async function doEnroll(ikmB64u) {
   setTimeout(() => { try { window.close(); } catch {} }, 1200);
 }
 
-async function doUnlock(envelope) {
-  setStatus("asserting credential — confirm with biometric or tap your security key…");
-  const credentialId = b64urlDecode(envelope.credentialId);
-  const prfSalt = b64urlDecode(envelope.prfSalt);
-  const wrappedIkm = b64urlDecode(envelope.wrappedIkm);
-  const wrapIv = b64urlDecode(envelope.wrapIv);
+async function doUnlock(payload) {
+  // v2 sent a single { envelope }; v3 sends { envelopes: [...] } so the
+  // user can pick any enrolled authenticator. Accept both for forward
+  // compat with older extensions, and prefer the list when present.
+  const envelopes = Array.isArray(payload.envelopes) && payload.envelopes.length > 0
+    ? payload.envelopes
+    : [payload.envelope].filter(Boolean);
+  if (envelopes.length === 0) {
+    throw new Error("no envelopes provided");
+  }
+
+  setStatus(
+    envelopes.length === 1
+      ? "asserting credential — confirm with biometric or tap your security key…"
+      : `tap any of your ${envelopes.length} enrolled authenticators…`,
+  );
+
+  // Build allowCredentials + per-credential PRF salts in one ceremony.
+  // WebAuthn's prf.evalByCredential lets the authenticator-of-the-user's-
+  // choice get the right salt without us knowing in advance which one
+  // they'll tap.
+  const allowCredentials = envelopes.map((e) => ({
+    type: "public-key",
+    id: b64urlDecode(e.credentialId),
+  }));
+  const evalByCredential = {};
+  for (const e of envelopes) {
+    evalByCredential[e.credentialId] = { first: b64urlDecode(e.prfSalt) };
+  }
+  // For single-envelope (legacy path), `eval` alone is enough; for multi
+  // we use `evalByCredential`. Include both to be permissive.
+  const prfExt =
+    envelopes.length === 1
+      ? { eval: { first: b64urlDecode(envelopes[0].prfSalt) } }
+      : { evalByCredential };
 
   const assertion = await navigator.credentials.get({
     publicKey: {
       challenge: crypto.getRandomValues(new Uint8Array(32)),
-      allowCredentials: [{ type: "public-key", id: credentialId }],
-      // Must match the UV setting used at enroll — Yubico's PRF derivation
-      // mixes in PIN-derived material when UV is on, so changing this
-      // produces a different PRF output and the wrap won't decrypt.
+      allowCredentials,
       userVerification: "discouraged",
-      extensions: { prf: { eval: { first: prfSalt } } },
+      extensions: { prf: prfExt },
       timeout: 60000,
     },
   });
@@ -163,6 +189,14 @@ async function doUnlock(envelope) {
   const prfFirst = prfResults && prfResults.results && prfResults.results.first;
   if (!prfFirst) {
     throw new Error("PRF evaluation failed — this device may not support it");
+  }
+
+  // Match the asserted credentialId against our envelope set to find the
+  // wrap to decrypt.
+  const usedIdB64u = b64urlEncode(assertion.rawId);
+  const matched = envelopes.find((e) => e.credentialId === usedIdB64u);
+  if (!matched) {
+    throw new Error("asserted credential did not match any enrolled authenticator");
   }
 
   const aesKey = await crypto.subtle.importKey(
@@ -173,11 +207,15 @@ async function doUnlock(envelope) {
     ["decrypt"],
   );
   const ikm = new Uint8Array(
-    await crypto.subtle.decrypt({ name: "AES-GCM", iv: wrapIv }, aesKey, wrappedIkm),
+    await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: b64urlDecode(matched.wrapIv) },
+      aesKey,
+      b64urlDecode(matched.wrappedIkm),
+    ),
   );
 
   setStatus("unwrapped vault key — handing back to extension…", "ok");
-  post({ kind: "unlocked", ikm: b64urlEncode(ikm) });
+  post({ kind: "unlocked", ikm: b64urlEncode(ikm), credentialId: usedIdB64u });
   msgEl.textContent = "All done. You can close this window.";
   setTimeout(() => { try { window.close(); } catch {} }, 1200);
 }
@@ -192,7 +230,9 @@ window.addEventListener("message", async (event) => {
       await doEnroll(event.data.ikm);
     } else if (action === "unlock") {
       msgEl.textContent = "Unlocking your vault…";
-      await doUnlock(event.data.envelope);
+      // Pass the whole event.data so doUnlock can pick envelope (legacy)
+      // or envelopes (v3) without us pre-flattening.
+      await doUnlock(event.data);
     } else {
       throw new Error("unknown action: " + action);
     }
