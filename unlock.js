@@ -1,24 +1,35 @@
-// rustofill biometric unlock page. Runs on https://tidalf.github.io/rustofill/
-// (or wherever you host it). The extension opens this page in a new window;
-// the bio-bridge content script on this origin relays messages between the
-// page and the extension service worker.
+// rustofill biometric unlock page. Hosted at https://tidalf.github.io/unlock/.
+// The extension opens this page in a new window; the bio-bridge content
+// script on this origin relays messages between the page and the SW.
 //
-// Two actions:
-//   action=enroll  → page receives an IKM from the extension, creates a
-//                    platform passkey with the PRF extension, wraps the IKM
-//                    under PRF(salt), returns {credentialId, prfSalt,
-//                    wrappedIkm, wrapIv} to the extension.
-//   action=unlock  → page receives the envelope from the extension, asks
-//                    WebAuthn to assert the credential and evaluate PRF on
-//                    the stored salt, unwraps the IKM under PRF(salt),
-//                    returns {ikm} to the extension.
+// Protocol (v3 — page is crypto-free; SW does all wrapping/unwrapping):
+//   action=enroll   → WebAuthn create + PRF eval on DISCOVERY_SALT.
+//                     Returns {credentialId, prfOutput} to the SW.
+//   action=unlock   → WebAuthn get with allowCredentials and per-credential
+//                     prfSalt via evalByCredential. Returns
+//                     {credentialId, prfOutput}.
+//   action=discover → Discoverable WebAuthn get (no allowCredentials),
+//                     PRF eval on DISCOVERY_SALT. Returns
+//                     {credentialId, prfOutput} for whichever credential
+//                     the user picked.
 //
-// All transport between page ↔ extension is via window.postMessage to the
-// same origin (the bridge content script listens on this window). The IKM
-// is never sent in a URL or persisted on this page.
+// The IKM never crosses this page in v3. Everything keyed off prfOutput is
+// computed on the SW side (envelope wrap/unwrap, discovery pubkey,
+// discovery encryption). The page is intentionally minimal.
 
 const msgEl = document.getElementById("msg");
 const statusEl = document.getElementById("status");
+
+// DISCOVERY_SALT = SHA-256("rustofill-prf-v1"). Constant across all installs;
+// allows the same authenticator to land on the same Nostr pubkey on every
+// device so a discoverable get() can find the published envelope.
+let DISCOVERY_SALT = null;
+async function initDiscoverySalt() {
+  if (DISCOVERY_SALT) return;
+  DISCOVERY_SALT = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode("rustofill-prf-v1")),
+  );
+}
 
 function setStatus(text, kind) {
   statusEl.textContent = text;
@@ -43,26 +54,11 @@ function post(payload) {
   window.postMessage({ source: "rustofill-bio", ...payload }, location.origin);
 }
 
-async function doEnroll(ikmB64u, _mode) {
-  // One enroll ceremony for everything — Touch ID, Hello, YubiKey, phone.
-  //
-  // userVerification: "preferred" surfaces Touch ID (which UV=discouraged
-  // would have filtered out on macOS Chrome) while still letting a
-  // YubiKey 5.4+ without PIN stay single-tap — the authenticator can't
-  // do UV without PIN so it falls back to UP-only and CTAP 2.1 uses
-  // CredRandomWithoutUV. PRF derivation stays consistent across enroll
-  // and unlock.
-  //
-  // No authenticatorAttachment hint: lets the user pick any device the
-  // browser offers (platform or roaming or hybrid-via-QR). The earlier
-  // split between "security-key" and "platform" was misleading because
-  // "cross-platform" in WebAuthn still includes hybrid/phone — so the
-  // chooser looked identical in both branches anyway.
+async function doEnroll() {
+  await initDiscoverySalt();
   setStatus("creating a credential — confirm with biometric, Touch ID, or tap your security key…");
-  const ikm = b64urlDecode(ikmB64u);
   const challenge = crypto.getRandomValues(new Uint8Array(32));
   const userId = crypto.getRandomValues(new Uint8Array(16));
-  const prfSalt = crypto.getRandomValues(new Uint8Array(32));
 
   const cred = await navigator.credentials.create({
     publicKey: {
@@ -71,31 +67,38 @@ async function doEnroll(ikmB64u, _mode) {
       challenge,
       pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
       authenticatorSelection: {
-        residentKey: "discouraged",
+        // "preferred" stores discoverable when the authenticator can, so a
+        // future device-2 setup can find this credential with a single
+        // discoverable get() — no allowCredentials, no sync code.
+        residentKey: "preferred",
         userVerification: "preferred",
       },
-      // Eval PRF on create — modern stacks return the result in
-      // getClientExtensionResults() so we don't need a follow-up get().
-      extensions: { prf: { eval: { first: prfSalt } } },
+      // Surface whether the cred actually landed discoverable. Touch ID /
+      // iCloud Keychain: yes. YubiKey 5 with slots: yes. YubiKey 5 with
+      // 25 slots full: silently non-discoverable (Discover won't find it).
+      extensions: {
+        prf: { eval: { first: DISCOVERY_SALT } },
+        credProps: true,
+      },
       timeout: 60000,
     },
   });
   if (!cred) throw new Error("credential creation cancelled");
 
-  // Try prf-on-create first. If the authenticator/browser didn't return a
-  // PRF result there, fall back to a follow-up get() (older stacks).
   let prfFirst;
   const createPrf = cred.getClientExtensionResults().prf;
   if (createPrf && createPrf.results && createPrf.results.first) {
     prfFirst = createPrf.results.first;
   } else {
+    // Older browsers / authenticators don't support prf-on-create; do a
+    // follow-up get() with the freshly created credential.
     setStatus("deriving wrapping key — confirm again…");
     const assertion = await navigator.credentials.get({
       publicKey: {
         challenge: crypto.getRandomValues(new Uint8Array(32)),
         allowCredentials: [{ type: "public-key", id: cred.rawId }],
         userVerification: "preferred",
-        extensions: { prf: { eval: { first: prfSalt } } },
+        extensions: { prf: { eval: { first: DISCOVERY_SALT } } },
         timeout: 60000,
       },
     });
@@ -103,51 +106,36 @@ async function doEnroll(ikmB64u, _mode) {
     prfFirst = r && r.results && r.results.first;
   }
   if (!prfFirst) {
-    throw new Error(
-      "this device or browser doesn't support the WebAuthn PRF extension",
-    );
+    throw new Error("this device or browser doesn't support the WebAuthn PRF extension");
   }
 
-  const aesKey = await crypto.subtle.importKey(
-    "raw",
-    prfFirst,
-    { name: "AES-GCM" },
-    false,
-    ["encrypt"],
-  );
-  const wrapIv = crypto.getRandomValues(new Uint8Array(12));
-  const wrappedIkm = new Uint8Array(
-    await crypto.subtle.encrypt({ name: "AES-GCM", iv: wrapIv }, aesKey, ikm),
-  );
+  const credProps = cred.getClientExtensionResults().credProps;
+  const discoverable = credProps && credProps.rk === true;
 
-  setStatus("authenticator enrolled — sending wrapped key to extension…", "ok");
+  setStatus("authenticator enrolled — handing back to extension…", "ok");
   post({
     kind: "enrolled",
     credentialId: b64urlEncode(cred.rawId),
-    prfSalt: b64urlEncode(prfSalt),
-    wrappedIkm: b64urlEncode(wrappedIkm),
-    wrapIv: b64urlEncode(wrapIv),
+    prfOutput: b64urlEncode(prfFirst),
+    discoverable: !!discoverable,
   });
-
   msgEl.textContent = "All done. You can close this window.";
-  // Auto-close after a beat (Chrome only allows close() on extension-opened tabs).
-  setTimeout(() => { try { window.close(); } catch {} }, 1200);
+  setTimeout(() => {
+    try {
+      window.close();
+    } catch (_e) {}
+  }, 1200);
 }
 
 async function doUnlock(payload) {
-  // v2 sent a single { envelope }; v3 sends { envelopes: [...] } so the
-  // user can pick any enrolled authenticator. Accept both for forward
-  // compat with older extensions, and prefer the list when present.
+  await initDiscoverySalt();
+  // SW passes the wrappers' (credentialId, prfSalt) pairs so we can build
+  // allowCredentials + evalByCredential. SW is responsible for unwrapping
+  // wrappedIkm using the prfOutput we return below.
   const envelopes = Array.isArray(payload.envelopes) && payload.envelopes.length > 0
     ? payload.envelopes
     : [payload.envelope].filter(Boolean);
-  if (envelopes.length === 0) {
-    throw new Error("no envelopes provided");
-  }
-  // Always "preferred" — matches enroll. Touch ID always does UV
-  // anyway (PRF stable); YubiKey 5.4+ without PIN falls through to UP
-  // and stays on CredRandomWithoutUV (also stable).
-  const uvMode = "preferred";
+  if (envelopes.length === 0) throw new Error("no envelopes provided");
 
   setStatus(
     envelopes.length === 1
@@ -155,20 +143,17 @@ async function doUnlock(payload) {
       : `tap any of your ${envelopes.length} enrolled authenticators…`,
   );
 
-  // Build allowCredentials + per-credential PRF salts in one ceremony.
-  // WebAuthn's prf.evalByCredential lets the authenticator-of-the-user's-
-  // choice get the right salt without us knowing in advance which one
-  // they'll tap.
   const allowCredentials = envelopes.map((e) => ({
     type: "public-key",
     id: b64urlDecode(e.credentialId),
   }));
+  // evalByCredential supports per-credential PRF salts in one ceremony, so
+  // mixed v1 (random salt) and v2 (constant DISCOVERY_SALT) wrappers can
+  // coexist on the same vault and unlock in one tap.
   const evalByCredential = {};
   for (const e of envelopes) {
     evalByCredential[e.credentialId] = { first: b64urlDecode(e.prfSalt) };
   }
-  // For single-envelope (legacy path), `eval` alone is enough; for multi
-  // we use `evalByCredential`. Include both to be permissive.
   const prfExt =
     envelopes.length === 1
       ? { eval: { first: b64urlDecode(envelopes[0].prfSalt) } }
@@ -178,7 +163,7 @@ async function doUnlock(payload) {
     publicKey: {
       challenge: crypto.getRandomValues(new Uint8Array(32)),
       allowCredentials,
-      userVerification: uvMode,
+      userVerification: "preferred",
       extensions: { prf: prfExt },
       timeout: 60000,
     },
@@ -189,33 +174,54 @@ async function doUnlock(payload) {
     throw new Error("PRF evaluation failed — this device may not support it");
   }
 
-  // Match the asserted credentialId against our envelope set to find the
-  // wrap to decrypt.
-  const usedIdB64u = b64urlEncode(assertion.rawId);
-  const matched = envelopes.find((e) => e.credentialId === usedIdB64u);
-  if (!matched) {
-    throw new Error("asserted credential did not match any enrolled authenticator");
+  setStatus("got prf output — handing back to extension…", "ok");
+  post({
+    kind: "unlocked",
+    credentialId: b64urlEncode(assertion.rawId),
+    prfOutput: b64urlEncode(prfFirst),
+  });
+  msgEl.textContent = "All done. You can close this window.";
+  setTimeout(() => {
+    try {
+      window.close();
+    } catch (_e) {}
+  }, 1200);
+}
+
+async function doDiscover() {
+  await initDiscoverySalt();
+  setStatus("tap your authenticator — looking for an enrolled rustofill credential…");
+
+  // Discoverable get: no allowCredentials. The authenticator will offer any
+  // resident credential it has for this rp.id. PRF evaluates on the
+  // well-known DISCOVERY_SALT so the prfOutput matches what device 1 used
+  // to derive the discovery pubkey + envelope wrap key.
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      userVerification: "preferred",
+      extensions: { prf: { eval: { first: DISCOVERY_SALT } } },
+      timeout: 60000,
+    },
+  });
+  const prfResults = assertion.getClientExtensionResults().prf;
+  const prfFirst = prfResults && prfResults.results && prfResults.results.first;
+  if (!prfFirst) {
+    throw new Error("PRF evaluation failed — this device may not support it");
   }
 
-  const aesKey = await crypto.subtle.importKey(
-    "raw",
-    prfFirst,
-    { name: "AES-GCM" },
-    false,
-    ["decrypt"],
-  );
-  const ikm = new Uint8Array(
-    await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: b64urlDecode(matched.wrapIv) },
-      aesKey,
-      b64urlDecode(matched.wrappedIkm),
-    ),
-  );
-
-  setStatus("unwrapped vault key — handing back to extension…", "ok");
-  post({ kind: "unlocked", ikm: b64urlEncode(ikm), credentialId: usedIdB64u });
+  setStatus("got prf output — fetching envelope from relays…", "ok");
+  post({
+    kind: "discovered",
+    credentialId: b64urlEncode(assertion.rawId),
+    prfOutput: b64urlEncode(prfFirst),
+  });
   msgEl.textContent = "All done. You can close this window.";
-  setTimeout(() => { try { window.close(); } catch {} }, 1200);
+  setTimeout(() => {
+    try {
+      window.close();
+    } catch (_e) {}
+  }, 1200);
 }
 
 window.addEventListener("message", async (event) => {
@@ -224,14 +230,14 @@ window.addEventListener("message", async (event) => {
   const { action } = event.data;
   try {
     if (action === "enroll") {
-      msgEl.textContent = "Enabling biometric unlock…";
-      // mode: "key" | "platform" — default to legacy "key" for back-compat
-      await doEnroll(event.data.ikm, event.data.mode);
+      msgEl.textContent = "Enrolling authenticator…";
+      await doEnroll();
     } else if (action === "unlock") {
       msgEl.textContent = "Unlocking your vault…";
-      // Pass the whole event.data so doUnlock can pick envelope (legacy)
-      // or envelopes (v3) without us pre-flattening.
       await doUnlock(event.data);
+    } else if (action === "discover") {
+      msgEl.textContent = "Discovering your vault…";
+      await doDiscover();
     } else {
       throw new Error("unknown action: " + action);
     }
